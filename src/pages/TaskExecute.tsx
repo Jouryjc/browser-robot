@@ -84,6 +84,7 @@ export default function TaskExecute() {
   const [isExecuting, setIsExecuting] = useState(false);
   const [currentStep, setCurrentStep] = useState('');
   const [selectedScreenshot, setSelectedScreenshot] = useState<TaskScreenshot | null>(null);
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pollCleanupRef = useRef<(() => void) | null>(null);
@@ -99,43 +100,115 @@ export default function TaskExecute() {
    * 加载任务数据
    */
   const loadTaskData = async () => {
+    setDebugInfo(prev => [...prev, `开始加载任务数据 - ID: ${id}`]);
+    
     if (!id) {
       setError('任务ID不存在');
       setLoading(false);
+      setDebugInfo(prev => [...prev, '错误: 任务ID不存在']);
       return;
     }
     
     try {
       setLoading(true);
       setError(null);
+      console.log('设置loading为true，开始获取任务数据...');
       
-      const [taskData, taskLogs, taskScreenshots] = await Promise.all([
-        indexedDBService.getTask(id).catch(err => {
-          console.error('获取任务数据失败:', err);
-          return null;
-        }),
-        indexedDBService.getTaskLogs(id).catch(err => {
-          console.error('获取任务日志失败:', err);
-          return [];
-        }),
-        indexedDBService.getTaskScreenshots(id).catch(err => {
-          console.error('获取任务截图失败:', err);
-          return [];
-        })
-      ]);
+      // 首先尝试从IndexedDB获取任务数据
+      let taskData: Task | null = null;
+      let taskLogs: TaskLog[] = [];
+      let taskScreenshots: TaskScreenshot[] = [];
+      
+      try {
+        [taskData, taskLogs, taskScreenshots] = await Promise.all([
+          indexedDBService.getTask(id),
+          indexedDBService.getTaskLogs(id),
+          indexedDBService.getTaskScreenshots(id)
+        ]);
+        setDebugInfo(prev => [...prev, `IndexedDB查询结果: ${taskData ? '找到任务' : '未找到任务'}`]);
+      } catch (err) {
+        console.error('从IndexedDB获取任务数据失败:', err);
+        setDebugInfo(prev => [...prev, `IndexedDB查询失败: ${err}`]);
+      }
+      
+      // 如果IndexedDB中没有找到任务，尝试从后端API获取
+      if (!taskData) {
+        console.log('IndexedDB中未找到任务，尝试从后端API获取...');
+        try {
+          const response = await fetch(`/api/tasks/${id}`);
+          if (response.ok) {
+            const apiResult = await response.json();
+            if (apiResult.success && apiResult.data) {
+              // 将后端任务数据转换为前端格式
+              const backendTask = apiResult.data;
+              taskData = {
+                id: backendTask.id,
+                title: backendTask.instructions || '未命名任务',
+                description: '',
+                url: backendTask.url,
+                instructions: backendTask.instructions,
+                status: backendTask.status as TaskStatus,
+                createdAt: backendTask.createdAt,
+                updatedAt: backendTask.updatedAt,
+                startedAt: backendTask.startedAt,
+                completedAt: backendTask.completedAt,
+                progress: 0,
+                totalSteps: backendTask.steps?.length || 0,
+                currentStep: 0,
+                error: backendTask.error
+              };
+              
+              // 将任务数据同步到IndexedDB
+              try {
+                await indexedDBService.createTask(taskData);
+                console.log('任务数据已同步到IndexedDB');
+              } catch (syncError) {
+                console.warn('同步任务数据到IndexedDB失败:', syncError);
+              }
+              
+              // 转换后端日志数据
+              if (backendTask.logs && Array.isArray(backendTask.logs)) {
+                taskLogs = backendTask.logs.map((log: any, index: number) => ({
+                  id: log.id || `log-${index}`,
+                  taskId: id,
+                  stepIndex: index,
+                  action: 'unknown',
+                  parameters: log.metadata || {},
+                  result: null,
+                  success: log.level !== 'error',
+                  message: log.message,
+                  level: log.level || 'info',
+                  timestamp: log.timestamp,
+                  duration: 0,
+                  error: log.level === 'error' ? log.message : undefined
+                }));
+              }
+            }
+          } else {
+            console.log('后端API也未找到任务');
+          }
+        } catch (apiError) {
+          console.error('从后端API获取任务失败:', apiError);
+        }
+      }
       
       if (!taskData) {
+        console.log('未找到任务数据');
         setError('任务不存在或已被删除');
         setTask(null);
         return;
       }
       
+      console.log('找到任务数据:', taskData);
+      
       // 验证任务数据的完整性
-      if (!taskData.id || !taskData.title) {
+      if (!taskData.id || !taskData.instructions) {
+        console.log('任务数据不完整:', { id: taskData.id, instructions: taskData.instructions });
         setError('任务数据不完整');
         return;
       }
       
+      console.log('设置任务数据到state');
       setTask(taskData);
       setLogs(taskLogs || []);
       setScreenshots(taskScreenshots || []);
@@ -151,20 +224,151 @@ export default function TaskExecute() {
 
   /**
    * 建立WebSocket连接监听任务执行
-   * 注意：当前版本暂不支持WebSocket实时监控
    */
   const connectWebSocket = () => {
-    if (!id) return;
+    setDebugInfo(prev => [...prev, `connectWebSocket被调用，id: ${id}`]);
+    if (!id) {
+      setDebugInfo(prev => [...prev, 'connectWebSocket: 缺少任务ID，退出']);
+      return;
+    }
     
     // 清理之前的轮询
     if (pollCleanupRef.current) {
       pollCleanupRef.current();
     }
     
-    // TODO: 实现WebSocket服务器端支持
-    console.log('WebSocket功能暂未实现，将使用轮询方式监控任务状态');
+    // 关闭现有的WebSocket连接
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
     
-    // 暂时使用轮询方式替代WebSocket
+    try {
+      // 创建WebSocket连接
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.hostname;
+      // 使用API服务器的端口 (3002)
+      const apiPort = '3002';
+      const wsUrl = `${protocol}//${host}:${apiPort}/ws?taskId=${id}`;
+      
+      setDebugInfo(prev => [...prev, `尝试连接WebSocket: ${wsUrl}`]);
+      console.log('尝试连接WebSocket:', wsUrl);
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+      
+      ws.onopen = () => {
+        setDebugInfo(prev => [...prev, 'WebSocket连接已建立']);
+        console.log('WebSocket连接已建立');
+      };
+      
+      ws.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          console.log('收到WebSocket消息:', data);
+          
+          switch (data.type) {
+            case 'task_log':
+              // 实时添加新日志
+              if (data.log) {
+                setLogs(prevLogs => [...prevLogs, data.log]);
+                // 自动滚动到底部
+                setTimeout(scrollToBottom, 100);
+              }
+              break;
+              
+            case 'task_status':
+              // 更新任务状态
+              if (data.status) {
+                setTask(prevTask => prevTask ? {
+                  ...prevTask,
+                  status: data.status.status,
+                  progress: data.status.progress || prevTask.progress,
+                  currentStep: data.status.currentStep || prevTask.currentStep,
+                  updatedAt: data.status.updatedAt || new Date().toISOString()
+                } : null);
+                
+                // 如果任务完成或失败，停止执行状态
+                if (data.status.status === TaskStatus.COMPLETED || 
+                    data.status.status === TaskStatus.FAILED ||
+                    data.status.status === TaskStatus.CANCELLED ||
+                    data.status.status === TaskStatus.STOPPED) {
+                  setIsExecuting(false);
+                }
+              }
+              break;
+              
+            case 'task_step':
+              // 更新当前步骤信息
+              if (data.step) {
+                setCurrentStep(data.step.description || data.step.action || '');
+                setTask(prevTask => prevTask ? {
+                  ...prevTask,
+                  currentStep: data.step.stepNumber || prevTask.currentStep
+                } : null);
+              }
+              break;
+              
+            case 'error':
+              // 处理错误消息
+              console.error('WebSocket错误:', data.message);
+              setError(data.message || '执行过程中发生错误');
+              break;
+              
+            default:
+              console.log('未知的WebSocket消息类型:', data.type);
+          }
+        } catch (err) {
+          console.error('解析WebSocket消息失败:', err);
+        }
+      };
+      
+      ws.onerror = (error) => {
+        setDebugInfo(prev => [...prev, `WebSocket连接错误: ${error}, URL: ${wsUrl}, readyState: ${ws.readyState}`]);
+        console.error('WebSocket连接错误:', error);
+        console.error('WebSocket URL:', wsUrl);
+        console.error('WebSocket readyState:', ws.readyState);
+        
+        // 如果WebSocket连接失败，回退到轮询模式
+        fallbackToPolling();
+      };
+      
+      ws.onclose = (event) => {
+        console.log('WebSocket连接已关闭:', event.code, event.reason);
+        console.log('WebSocket URL:', wsUrl);
+        wsRef.current = null;
+        
+        // 如果是异常关闭且任务仍在执行，尝试重连
+        if (event.code !== 1000 && isExecuting) {
+          console.log('WebSocket异常关闭，3秒后尝试重连...');
+          setTimeout(() => {
+            if (isExecuting) {
+              connectWebSocket();
+            }
+          }, 3000);
+        } else if (event.code !== 1000) {
+          console.warn('WebSocket连接异常关闭，但任务未在执行，不重连');
+        }
+      };
+      
+    } catch (err) {
+      console.error('创建WebSocket连接失败:', err);
+      // 回退到轮询模式
+      fallbackToPolling();
+    }
+  };
+  
+  /**
+   * 回退到轮询模式
+   */
+  const fallbackToPolling = () => {
+    console.log('WebSocket不可用，回退到轮询模式');
+    
+    // 清理之前的轮询
+    if (pollCleanupRef.current) {
+      pollCleanupRef.current();
+    }
+    
+    // 启动轮询
     const pollInterval = setInterval(async () => {
       if (!isExecuting) {
         clearInterval(pollInterval);
@@ -320,20 +524,36 @@ export default function TaskExecute() {
     return Math.round((task.currentStep / task.totalSteps) * 100);
   };
 
-  // 组件挂载时加载数据
+  // 组件挂载时加载数据并建立WebSocket连接
   useEffect(() => {
     loadTaskData();
     
     // 组件卸载时清理资源
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      // 清理轮询
       if (pollCleanupRef.current) {
         pollCleanupRef.current();
       }
+      // 关闭WebSocket连接
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [id]);
+  
+  // 当任务数据加载完成后，自动建立WebSocket连接
+  useEffect(() => {
+    setDebugInfo(prev => [...prev, `useEffect触发 - task: ${task?.id}, id: ${id}`]);
+    if (task && id && !wsRef.current) {
+      setDebugInfo(prev => [...prev, `任务数据已加载，准备建立WebSocket连接 - 状态: ${task.status}`]);
+      connectWebSocket();
+    } else if (wsRef.current) {
+      setDebugInfo(prev => [...prev, 'WebSocket连接已存在，跳过重复连接']);
+    } else {
+      setDebugInfo(prev => [...prev, '任务数据未准备好，跳过WebSocket连接']);
+    }
+  }, [task, id]);
 
   // 日志更新时自动滚动
   useEffect(() => {
@@ -388,6 +608,20 @@ export default function TaskExecute() {
 
   return (
     <div className="max-w-7xl mx-auto">
+      {/* 调试信息 - 始终显示 */}
+      <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+        <h4 className="font-semibold text-yellow-800 mb-2">调试信息 (共{debugInfo.length}条):</h4>
+        <div className="text-sm text-yellow-700 space-y-1">
+          {debugInfo.length === 0 ? (
+            <div>暂无调试信息</div>
+          ) : (
+            debugInfo.map((info, index) => (
+              <div key={index}>{info}</div>
+            ))
+          )}
+        </div>
+      </div>
+      
       {/* 页面标题和返回按钮 */}
       <div className="flex items-center mb-6">
         <button

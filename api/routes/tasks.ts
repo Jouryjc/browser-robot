@@ -5,8 +5,10 @@
 
 import express, { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { gptService } from '../services/gpt-service.js';
-import { browserService } from '../services/browser-service.js';
+import { gptService, TaskStep as GPTTaskStep } from '../services/gpt-service.js';
+import { browserService, TaskStep as BrowserTaskStep } from '../services/browser-service.js';
+import { webSocketService } from '../services/websocket-service.js';
+import { taskLogger } from '../utils/logger.js';
 
 const router = express.Router();
 
@@ -36,6 +38,8 @@ interface TaskStep {
   parameters: any;
   status: 'pending' | 'running' | 'completed' | 'failed';
   executedAt?: Date;
+  retryCount?: number;
+  description?: string;
 }
 
 interface TaskLog {
@@ -123,7 +127,7 @@ router.post('/create', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('创建任务失败:', error);
+    taskLogger.error('创建任务失败', {}, error);
     res.status(500).json({
       success: false,
       error: '创建任务失败'
@@ -156,12 +160,9 @@ router.post('/:id/execute', async (req: Request, res: Response) => {
           task.updatedAt = new Date();
           
           // 添加开始执行日志
-          task.logs.push({
-            id: uuidv4(),
-            level: 'info',
-            message: '开始执行任务',
-            timestamp: new Date()
-          });
+          addTaskLog(task, 'info', '开始执行任务');
+          taskLogger.info('任务开始执行', { taskId: id });
+          
 
           // 启动浏览器自动化执行
           executeTaskAutomation(task).catch(error => {
@@ -181,12 +182,7 @@ router.post('/:id/execute', async (req: Request, res: Response) => {
           task.status = 'pending';
           task.updatedAt = new Date();
           
-          task.logs.push({
-            id: uuidv4(),
-            level: 'info',
-            message: '任务已暂停',
-            timestamp: new Date()
-          });
+          addTaskLog(task, 'info', '任务已暂停');
         }
         break;
       case 'resume':
@@ -194,12 +190,7 @@ router.post('/:id/execute', async (req: Request, res: Response) => {
           task.status = 'running';
           task.updatedAt = new Date();
           
-          task.logs.push({
-            id: uuidv4(),
-            level: 'info',
-            message: '任务已恢复',
-            timestamp: new Date()
-          });
+          addTaskLog(task, 'info', '任务已恢复');
         }
         break;
       case 'stop':
@@ -235,7 +226,7 @@ router.post('/:id/execute', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('执行任务控制失败:', error);
+    taskLogger.error('执行任务控制失败', {}, error);
     res.status(500).json({
       success: false,
       error: '执行任务控制失败'
@@ -269,7 +260,7 @@ router.get('/:id/status', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('查询任务状态失败:', error);
+    taskLogger.error('查询任务状态失败', {}, error);
     res.status(500).json({
       success: false,
       error: '查询任务状态失败'
@@ -327,7 +318,7 @@ router.get('/', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('查询任务历史失败:', error);
+    taskLogger.error('查询任务历史失败', {}, error);
     res.status(500).json({
       success: false,
       error: '查询任务历史失败'
@@ -356,10 +347,10 @@ router.get('/:id', async (req: Request, res: Response) => {
       data: task
     });
   } catch (error) {
-    console.error('获取任务详情失败:', error);
-    res.status(500).json({
+    taskLogger.error('获取任务详情失败', {}, error);
+    res.status(404).json({
       success: false,
-      error: '获取任务详情失败'
+      error: '任务不存在'
     });
   }
 });
@@ -370,70 +361,54 @@ router.get('/:id', async (req: Request, res: Response) => {
  */
 async function executeTaskAutomation(task: Task): Promise<void> {
   try {
-    console.log('开始执行任务自动化:', task.id);
-    console.log('任务描述:', task.instructions);
+    taskLogger.info('开始执行任务自动化', { taskId: task.id });
+    taskLogger.info('任务描述', {}, task.instructions);
     
     // 添加开始解析日志
-    task.logs.push({
-      id: uuidv4(),
-      level: 'info',
-      message: '开始解析任务指令...',
-      timestamp: new Date()
-    });
+    addTaskLog(task, 'info', '开始解析任务指令...');
 
     // 1. 使用GPT服务解析任务指令为具体步骤
-    const steps = await gptService.parseInstructions(task.url, task.instructions);
-    task.steps = steps;
-    
-    task.logs.push({
-      id: uuidv4(),
-      level: 'info',
-      message: `任务解析完成，共生成 ${steps.length} 个执行步骤`,
-      timestamp: new Date()
-    });
+    let steps: TaskStep[];
+    try {
+      taskLogger.info('正在调用GPT服务解析指令...', { url: task.url, instructions: task.instructions });
+      steps = await gptService.parseInstructions(task.url, task.instructions);
+      task.steps = steps;
+      taskLogger.info('GPT服务解析指令成功', { stepsCount: steps.length });
+      addTaskLog(task, 'info', `任务解析完成，共生成 ${steps.length} 个执行步骤`);
+    } catch (gptError) {
+      taskLogger.error('GPT服务解析指令失败', { error: gptError.message }, gptError);
+      addTaskLog(task, 'error', `GPT服务解析失败: ${gptError.message}`);
+      task.status = 'failed';
+      return;
+    }
 
     // 2. 初始化服务连接
-    console.log('正在初始化 GPT 服务...');
+    taskLogger.info('正在初始化 GPT 服务...');
     await gptService.initialize();
-    console.log('GPT 服务初始化完成');
+    taskLogger.info('GPT 服务初始化完成');
     
-    console.log('正在连接浏览器服务...');
+    taskLogger.info('正在连接浏览器服务...');
     await browserService.connect();
-    console.log('浏览器服务连接完成');
+    taskLogger.info('浏览器服务连接完成');
     
     // 获取并记录可用的MCP工具列表
     try {
       const mcpService = browserService.getMCPService();
-      console.log('正在获取可用的 MCP 工具...');
+      taskLogger.info('正在获取可用的 MCP 工具...');
       const toolsList = await mcpService.listTools();
-      console.log('可用的 MCP 工具:', toolsList.tools?.map(t => t.name) || []);
+      taskLogger.info('可用的 MCP 工具', {}, toolsList.tools?.map(t => t.name) || []);
       
-      task.logs.push({
-        id: uuidv4(),
-        level: 'info',
-        message: `MCP 可用工具列表: ${JSON.stringify(toolsList.tools?.map(t => t.name) || [], null, 2)}`,
-        timestamp: new Date()
-      });
+      addTaskLog(task, 'info', `MCP 可用工具列表: ${JSON.stringify(toolsList.tools?.map(t => t.name) || [], null, 2)}`);
     } catch (error) {
-      task.logs.push({
-        id: uuidv4(),
-        level: 'warn',
-        message: `获取MCP工具列表失败: ${error.message}`,
-        timestamp: new Date()
-      });
+      addTaskLog(task, 'warn', `获取MCP工具列表失败: ${error.message}`);
     }
     
-    task.logs.push({
-      id: uuidv4(),
-      level: 'info',
-      message: 'MCP 服务连接成功，开始执行自动化步骤...',
-      timestamp: new Date()
-    });
+    addTaskLog(task, 'info', 'MCP 服务连接成功，开始执行自动化步骤...');
 
     // 3. 创建新的浏览器标签页
-    console.log('正在创建新标签页...');
+    taskLogger.info('正在创建新标签页...');
     const pageId = await browserService.createNewTab();
-    console.log('创建的页面 ID:', pageId);
+    taskLogger.info('创建的页面 ID', {}, pageId);
     
     task.logs.push({
       id: uuidv4(),
@@ -446,8 +421,8 @@ async function executeTaskAutomation(task: Task): Promise<void> {
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       
-      console.log(`\n=== 执行步骤 ${i + 1}/${steps.length} ===`);
-      console.log('指令详情:', step);
+      taskLogger.info(`执行步骤 ${i + 1}/${steps.length}`);
+      taskLogger.debug('指令详情', {}, step);
       
       // 检查任务是否被暂停或停止
       if (task.status !== 'running') {
@@ -466,33 +441,18 @@ async function executeTaskAutomation(task: Task): Promise<void> {
       try {
         const isHealthy = await browserService.healthCheck();
         if (!isHealthy) {
-          console.log(`步骤 ${i + 1} 执行前检测到连接异常，尝试重新连接...`);
-          task.logs.push({
-            id: uuidv4(),
-            level: 'warn',
-            message: `步骤 ${step.stepNumber} 执行前检测到连接异常，正在重新连接...`,
-            timestamp: new Date()
-          });
+          taskLogger.warn(`步骤 ${i + 1} 执行前检测到连接异常，尝试重新连接...`);
+          addTaskLog(task, 'warn', `步骤 ${step.stepNumber} 执行前检测到连接异常，正在重新连接...`);
           
           // 先断开旧连接，再建立新连接
           await browserService.disconnect();
           await browserService.connect();
           
-          task.logs.push({
-            id: uuidv4(),
-            level: 'info',
-            message: `步骤 ${step.stepNumber} 连接已恢复`,
-            timestamp: new Date()
-          });
+          addTaskLog(task, 'info', `步骤 ${step.stepNumber} 连接已恢复`);
         }
       } catch (healthCheckError) {
-        console.error(`步骤 ${i + 1} 连接健康检查失败:`, healthCheckError);
-        task.logs.push({
-          id: uuidv4(),
-          level: 'error',
-          message: `步骤 ${step.stepNumber} 连接检查失败: ${healthCheckError.message}`,
-          timestamp: new Date()
-        });
+        taskLogger.error(`步骤 ${i + 1} 连接健康检查失败`, {}, healthCheckError);
+        addTaskLog(task, 'error', `步骤 ${step.stepNumber} 连接检查失败: ${healthCheckError.message}`);
         
         // 连接检查失败，跳过当前步骤但不中断整个任务
         step.status = 'failed';
@@ -503,12 +463,7 @@ async function executeTaskAutomation(task: Task): Promise<void> {
       step.status = 'running';
       step.executedAt = new Date();
       
-      task.logs.push({
-        id: uuidv4(),
-        level: 'info',
-        message: `执行步骤 ${step.stepNumber}: ${step.description}`,
-        timestamp: new Date()
-      });
+      addTaskLog(task, 'info', `执行步骤 ${step.stepNumber}: ${step.description}`);
 
       // 执行步骤 - 使用 MCP 协议
       try {
@@ -517,62 +472,99 @@ async function executeTaskAutomation(task: Task): Promise<void> {
         
         switch (step.action) {
           case 'navigate':
-            console.log(`导航到: ${step.parameters.url || task.url}`);
-            result = await browserService.navigate(step.parameters.url || task.url);
+          case 'navigate_page':
+            taskLogger.info(`导航到: ${step.parameters.url || task.url}`);
+            result = await browserService.executeStep({
+              ...step,
+              action: 'navigate',
+              parameters: { url: step.parameters.url || task.url }
+            });
             break;
           case 'click':
-            console.log(`点击元素: ${step.parameters.selector}`);
-            result = await browserService.click(step.parameters.selector);
+            taskLogger.info(`点击元素: ${step.parameters.selector}`);
+            result = await browserService.executeStep(step);
             break;
           case 'type':
-            console.log(`输入文本到: ${step.parameters.selector}`);
-            result = await browserService.type(step.parameters.selector, step.parameters.text);
+          case 'fill':
+            taskLogger.info(`输入文本到: ${step.parameters.selector}`);
+            result = await browserService.executeStep({
+              ...step,
+              action: 'type',
+              parameters: {
+                selector: step.parameters.selector,
+                text: step.parameters.text || step.parameters.value
+              }
+            });
             break;
           case 'scroll':
-            console.log(`滚动: ${step.parameters.direction || 'down'}, 距离: ${step.parameters.distance || 300}`);
-            result = await browserService.scroll(step.parameters.direction || 'down', step.parameters.distance || 300);
+            taskLogger.info(`滚动: ${step.parameters.direction || 'down'}, 距离: ${step.parameters.distance || 300}`);
+            result = await browserService.executeStep({
+              ...step,
+              parameters: {
+                direction: step.parameters.direction || 'down',
+                distance: step.parameters.distance || 300
+              }
+            });
             break;
           case 'wait':
-            console.log(`等待: ${step.parameters.selector || step.parameters.condition}`);
-            result = await browserService.waitFor(step.parameters.selector || step.parameters.condition);
+          case 'wait_for':
+            taskLogger.info(`等待: ${step.parameters.selector || step.parameters.condition || step.parameters.text}`);
+            result = await browserService.executeStep({
+              ...step,
+              action: 'wait',
+              parameters: {
+                condition: step.parameters.selector || step.parameters.condition || step.parameters.text
+              }
+            });
             break;
           case 'screenshot':
-            console.log('正在截图...');
-            result = await browserService.takeScreenshot();
+          case 'take_screenshot':
+            taskLogger.info('正在截图...');
+            result = await browserService.executeStep({
+              ...step,
+              action: 'screenshot'
+            });
             break;
           case 'extract':
-            console.log(`提取数据: ${step.parameters.selector}`);
-            result = await browserService.extractData(step.parameters.selector, step.parameters.attribute);
+          case 'take_snapshot':
+            taskLogger.info(`提取数据: ${step.parameters.selector}`);
+            result = await browserService.executeStep(step);
             break;
           default:
             throw new Error(`不支持的操作类型: ${step.action}`);
         }
         
         const stepDuration = Date.now() - stepStartTime;
-        console.log(`步骤 ${i + 1} 执行完成，耗时: ${stepDuration}ms`);
+        taskLogger.info(`步骤 ${i + 1} 执行完成，耗时: ${stepDuration}ms`);
         
         step.status = 'completed';
-        task.logs.push({
-          id: uuidv4(),
-          level: 'info',
-          message: `步骤 ${step.stepNumber} 执行成功: ${step.description}`,
-          timestamp: new Date()
-        });
+        addTaskLog(task, 'info', `步骤 ${step.stepNumber} 执行成功: ${step.description}`);
 
         // 如果是截图操作，保存截图数据
-        if (step.action === 'screenshot' && result) {
-          task.screenshots.push({
-            id: uuidv4(),
-            stepNumber: step.stepNumber,
-            imageUrl: result.imageUrl || result.data,
-            description: step.description,
-            timestamp: new Date()
-          });
+        if ((step.action === 'screenshot' || step.action === 'take_screenshot') && result && result.success) {
+          // 从BrowserActionResult中提取截图数据
+          const screenshotData = result.screenshot || result.data;
+          addTaskLog(task, 'debug', `截图结果检查: success=${result.success}, screenshot=${!!result.screenshot}, data=${!!result.data}`);
+          
+          if (screenshotData) {
+            task.screenshots.push({
+              id: uuidv4(),
+              stepNumber: step.stepNumber,
+              imageUrl: screenshotData,
+              description: step.description,
+              timestamp: new Date()
+            });
+            addTaskLog(task, 'info', `截图已保存: ${step.description}`);
+          } else {
+            addTaskLog(task, 'warn', `截图数据为空: ${step.description}`);
+          }
+        } else if (step.action === 'screenshot' || step.action === 'take_screenshot') {
+          addTaskLog(task, 'warn', `截图步骤未成功执行: success=${result?.success}, result=${!!result}`);
         }
         
       } catch (stepError) {
         const errorMessage = stepError instanceof Error ? stepError.message : '未知错误';
-        console.error(`步骤 ${i + 1} 执行失败:`, stepError);
+        taskLogger.error(`步骤 ${i + 1} 执行失败`, {}, stepError);
         
         // 【修复关键点2】智能错误识别和重试机制
         // 检查是否为连接相关错误，如果是则尝试重连后重试
@@ -583,13 +575,8 @@ async function executeTaskAutomation(task: Task): Promise<void> {
                                  errorMessage.toLowerCase().includes('mcp');
         
         if (isConnectionError && !step.retryCount) {
-          console.log(`步骤 ${i + 1} 检测到连接错误，尝试重连后重试...`);
-          task.logs.push({
-            id: uuidv4(),
-            level: 'warn',
-            message: `步骤 ${step.stepNumber} 检测到连接错误，正在重连后重试: ${errorMessage}`,
-            timestamp: new Date()
-          });
+          taskLogger.warn(`步骤 ${i + 1} 检测到连接错误，尝试重连后重试...`);
+          addTaskLog(task, 'warn', `步骤 ${step.stepNumber} 检测到连接错误，正在重连后重试: ${errorMessage}`);
           
           try {
             // 【修复关键点3】重新建立连接的完整流程
@@ -603,48 +590,42 @@ async function executeTaskAutomation(task: Task): Promise<void> {
             i--; // 重新执行当前步骤
             continue;
           } catch (reconnectError) {
-            console.error(`步骤 ${i + 1} 重连失败:`, reconnectError);
-            task.logs.push({
-              id: uuidv4(),
-              level: 'error',
-              message: `步骤 ${step.stepNumber} 重连失败: ${reconnectError.message}`,
-              timestamp: new Date()
-            });
+            taskLogger.error(`步骤 ${i + 1} 重连失败`, {}, reconnectError);
+            addTaskLog(task, 'error', `步骤 ${step.stepNumber} 重连失败: ${reconnectError.message}`);
           }
         }
         
         // 步骤最终失败
         step.status = 'failed';
-        task.logs.push({
-          id: uuidv4(),
-          level: 'error',
-          message: `步骤 ${step.stepNumber} 执行失败: ${errorMessage}`,
-          timestamp: new Date()
-        });
+        addTaskLog(task, 'error', `步骤 ${step.stepNumber} 执行失败: ${errorMessage}`);
         
         // 步骤失败时继续执行后续步骤，但记录失败信息
-        console.log(`步骤 ${i + 1} 失败，继续执行后续步骤...`);
+        taskLogger.info(`步骤 ${i + 1} 失败，继续执行后续步骤...`);
       }
 
       // 更新任务进度
       const completedSteps = task.steps.filter(s => s.status === 'completed').length;
       const progress = (completedSteps / task.steps.length) * 100;
       
+      // 推送进度更新到前端
+      webSocketService.sendTaskStatus(task.id, {
+        status: task.status,
+        progress: Math.round(progress),
+        completedSteps,
+        totalSteps: task.steps.length,
+        updatedAt: new Date()
+      });
+      
       // 添加进度日志
       if (i % 3 === 0 || i === steps.length - 1) { // 每3步或最后一步记录进度
-        task.logs.push({
-          id: uuidv4(),
-          level: 'info',
-          message: `任务进度: ${Math.round(progress)}% (${completedSteps}/${task.steps.length})`,
-          timestamp: new Date()
-        });
+        addTaskLog(task, 'info', `任务进度: ${Math.round(progress)}% (${completedSteps}/${task.steps.length})`);
       }
 
       // 步骤间短暂延迟，避免操作过快
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
-    console.log('\n=== 任务自动化执行完成 ===');
+    taskLogger.info('\n=== 任务自动化执行完成 ===');
     
     // 【修复关键点4】任务完成后的连接保持策略
     // 任务执行完成后不再自动断开浏览器服务连接
@@ -655,69 +636,125 @@ async function executeTaskAutomation(task: Task): Promise<void> {
     
     if (failedSteps === 0) {
       task.status = 'completed';
-      task.logs.push({
-        id: uuidv4(),
-        level: 'info',
-        message: `任务执行完成！成功执行 ${completedSteps} 个步骤`,
-        timestamp: new Date()
-      });
+      addTaskLog(task, 'info', `任务执行完成！成功执行 ${completedSteps} 个步骤`);
     } else {
       task.status = 'failed';
-      task.logs.push({
-        id: uuidv4(),
-        level: 'error',
-        message: `任务执行完成，但有 ${failedSteps} 个步骤失败`,
-        timestamp: new Date()
-      });
+      addTaskLog(task, 'error', `任务执行完成，但有 ${failedSteps} 个步骤失败`);
     }
     
     task.completedAt = new Date();
     task.updatedAt = new Date();
 
     // 6. 任务完成，保持连接以供后续任务使用
-    console.log('任务执行完成，保持浏览器服务连接以供后续任务使用');
-    // 注意：不在这里断开连接，让连接保持活跃状态供后续任务使用
+    // 【优化】连接保持策略 - 任务完成后保持连接活跃，避免频繁重连
+    try {
+      taskLogger.info('任务执行完成，实施连接保持策略...');
+      
+      // 检查连接健康状态
+      const isHealthy = await browserService.healthCheck();
+      if (isHealthy) {
+        taskLogger.info('连接状态良好，保持连接活跃以供后续任务使用');
+      } else {
+        taskLogger.info('连接状态异常，尝试重新建立连接...');
+        await browserService.connect();
+        taskLogger.info('连接已重新建立并保持活跃');
+      }
+    } catch (connectionError) {
+      taskLogger.error('连接保持策略执行失败', {}, connectionError);
+    }
     
   } catch (error) {
-    console.error('\n=== 任务自动化执行失败 ===');
-    console.error('错误详情:', error);
-    
+    taskLogger.error('任务自动化执行失败', {}, error);
     task.status = 'failed';
-    task.logs.push({
-      id: uuidv4(),
-      level: 'error',
-      message: `任务执行异常: ${error instanceof Error ? error.message : '未知错误'}`,
-      timestamp: new Date()
-    });
+    addTaskLog(task, 'error', `任务执行异常: ${error instanceof Error ? error.message : '未知错误'}`);
     task.completedAt = new Date();
     task.updatedAt = new Date();
     
     // 发生异常时进行连接清理和重置
     try {
-      console.log('任务执行异常，检查连接状态...');
+      taskLogger.info('任务执行异常，检查连接状态...');
       
       // 检查连接健康状态
       const isHealthy = await browserService.healthCheck();
       if (!isHealthy) {
-        console.log('连接不健康，尝试重新连接...');
-        await browserService.disconnect();
+        taskLogger.info('连接不健康，尝试重新连接...');
         await browserService.connect();
-        console.log('连接已重新建立');
+        taskLogger.info('连接已重新建立');
       } else {
-        console.log('连接状态正常，保持连接');
+        taskLogger.info('连接状态正常，保持连接');
       }
     } catch (reconnectError) {
-      console.error('重新连接时出错:', reconnectError);
+      taskLogger.error('重新连接时出错', {}, reconnectError);
       // 最后手段：强制断开连接
       try {
         await browserService.disconnect();
       } catch (forceDisconnectError) {
-        console.error('强制断开连接时出错:', forceDisconnectError);
+        taskLogger.error('强制断开连接时出错', {}, forceDisconnectError);
       }
     }
     
     throw error;
   }
+}
+
+/**
+ * 添加任务日志并通过WebSocket推送
+ * @param task 任务对象
+ * @param level 日志级别
+ * @param message 日志消息
+ * @param metadata 可选的元数据
+ */
+function addTaskLog(task: Task, level: 'info' | 'warn' | 'error' | 'debug', message: string, metadata?: any): void {
+  const log: TaskLog = {
+    id: uuidv4(),
+    level,
+    message,
+    metadata,
+    timestamp: new Date()
+  };
+  
+  task.logs.push(log);
+  
+  // 通过WebSocket实时推送日志
+  webSocketService.sendTaskLog(task.id, log);
+}
+
+/**
+ * 更新任务状态并通过WebSocket推送
+ * @param task 任务对象
+ * @param status 新状态
+ */
+function updateTaskStatus(task: Task, status: Task['status']): void {
+  task.status = status;
+  task.updatedAt = new Date();
+  
+  // 通过WebSocket推送状态更新
+  webSocketService.sendTaskStatus(task.id, {
+    status,
+    updatedAt: task.updatedAt
+  });
+}
+
+/**
+ * 更新任务步骤状态并通过WebSocket推送
+ * @param task 任务对象
+ * @param step 步骤对象
+ * @param status 新状态
+ */
+function updateStepStatus(task: Task, step: TaskStep, status: TaskStep['status']): void {
+  step.status = status;
+  if (status === 'running') {
+    step.executedAt = new Date();
+  }
+  
+  // 通过WebSocket推送步骤更新
+  webSocketService.sendTaskStep(task.id, {
+    stepNumber: step.stepNumber,
+    action: step.action,
+    status,
+    description: step.description || `${step.action} 操作`,
+    executedAt: step.executedAt
+  });
 }
 
 export default router;

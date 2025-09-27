@@ -3,8 +3,21 @@
  * 使用 MCP 协议和 chrome-devtools-mcp 执行浏览器操作
  */
 
-import { TaskStep } from '../types/task.js';
 import { mcpService } from './mcp-service.js';
+import { browserLogger } from '../utils/logger.js';
+
+/**
+ * 任务步骤接口定义
+ */
+export interface TaskStep {
+  id: string;
+  stepNumber: number;
+  action: string;
+  parameters: any;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  executedAt?: Date;
+  retryCount?: number;
+}
 
 /**
  * 浏览器操作结果接口
@@ -28,6 +41,17 @@ export interface BrowserTab {
 }
 
 /**
+ * 连接池状态接口
+ */
+interface ConnectionPoolStatus {
+  totalConnections: number;
+  activeConnections: number;
+  idleConnections: number;
+  lastUsedTime: number;
+  connectionHealth: boolean;
+}
+
+/**
  * 浏览器自动化服务类，使用 MCP 服务进行浏览器自动化操作
  */
 export class BrowserService {
@@ -37,87 +61,192 @@ export class BrowserService {
   private connectionTimeout = 15000; // 15秒连接超时
   private lastConnectionTime: number = 0;
   private connectionCooldown = 5000; // 5秒连接冷却时间
+  
+  // 持久化连接管理
+  private lastActivityTime: number = Date.now();
+  private connectionIdleTimeout = 300000; // 5分钟空闲超时
+  private keepAliveInterval: NodeJS.Timeout | null = null;
+  private connectionPool: Map<string, any> = new Map();
+  private maxPoolSize = 5;
+  private connectionHealthCheckInterval = 30000; // 30秒健康检查间隔
 
   /**
-   * 连接到浏览器服务（增强版）
+   * 连接到 MCP 服务
    */
   async connect(): Promise<void> {
     const now = Date.now();
     
     // 检查连接冷却时间
     if (now - this.lastConnectionTime < this.connectionCooldown) {
-      console.log('连接冷却中，跳过重复连接请求');
-      return;
+      browserLogger.info(`连接冷却中，等待 ${this.connectionCooldown - (now - this.lastConnectionTime)}ms`);
+      await new Promise(resolve => setTimeout(resolve, this.connectionCooldown - (now - this.lastConnectionTime)));
     }
-    
+
     try {
-      console.log('正在连接浏览器服务...');
+      browserLogger.info('正在连接到 MCP 服务...');
       
-      // 设置连接超时
-      const connectPromise = mcpService.initialize();
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('浏览器服务连接超时')), this.connectionTimeout);
-      });
-      
-      // 等待连接完成或超时
-      await Promise.race([connectPromise, timeoutPromise]);
-      
-      // 连接成功后进行验证
-      const isHealthy = await this.healthCheck();
-      if (!isHealthy) {
-        throw new Error('浏览器服务连接后健康检查失败');
-      }
+      // 连接到 MCP 服务
+      await mcpService.initialize();
       
       this.lastConnectionTime = now;
-      this.connectionRetryCount = 0; // 重置重试计数
+      this.lastActivityTime = now;
+      this.connectionRetryCount = 0;
       
-      console.log('浏览器服务连接成功并通过健康检查');
+      // 启动持久化连接管理
+      this.startPersistentConnectionManagement();
+      
+      browserLogger.info('MCP 服务连接成功');
     } catch (error) {
-      console.error('连接浏览器失败:', error);
+      this.connectionRetryCount++;
+      browserLogger.error(`MCP 服务连接失败 (尝试 ${this.connectionRetryCount}/${this.maxConnectionRetries}):`, error);
       
-      // 连接失败时清理状态
-      this.currentPageId = null;
-      this.resetConnectionState();
-      
-      // 尝试重连
       if (this.connectionRetryCount < this.maxConnectionRetries) {
-        this.connectionRetryCount++;
-        console.log(`尝试第 ${this.connectionRetryCount} 次重连浏览器服务...`);
+        const retryDelay = Math.min(1000 * Math.pow(2, this.connectionRetryCount), 10000);
+        browserLogger.info(`${retryDelay}ms 后重试连接...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
         
-        // 等待一段时间后重试
-        await new Promise(resolve => setTimeout(resolve, 2000 * this.connectionRetryCount));
-        return await this.connect();
+        try {
+          await this.connect();
+        } catch (retryError) {
+          browserLogger.error('重试连接失败:', retryError);
+          throw retryError;
+        }
+      } else {
+        browserLogger.error('已达到最大重试次数，连接失败');
+        throw error;
       }
-      
+    }
+  }
+
+  /**
+   * 启动持久化连接管理
+   */
+  private startPersistentConnectionManagement(): void {
+    // 清理现有的定时器
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+    }
+
+    // 启动保活和健康检查定时器
+    this.keepAliveInterval = setInterval(async () => {
+      try {
+        const now = Date.now();
+        
+        // 检查空闲超时
+        if (now - this.lastActivityTime > this.connectionIdleTimeout) {
+          browserLogger.info('连接空闲超时，执行清理...');
+          await this.cleanupIdleConnections();
+          return;
+        }
+
+        // 执行健康检查
+        const isHealthy = await this.healthCheck();
+        if (!isHealthy) {
+          browserLogger.warn('连接健康检查失败，尝试重新连接...');
+          await this.reconnect();
+        } else {
+          browserLogger.debug('连接健康检查通过，保持活跃状态');
+        }
+      } catch (error) {
+        browserLogger.error('持久化连接管理出错:', error);
+      }
+    }, this.connectionHealthCheckInterval);
+
+    browserLogger.info('持久化连接管理已启动');
+  }
+
+  /**
+   * 重新连接
+   */
+  private async reconnect(): Promise<void> {
+    try {
+      browserLogger.info('正在重新建立连接...');
+      await this.disconnect();
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 等待1秒
+      await this.connect();
+      browserLogger.info('重新连接成功');
+    } catch (error) {
+      browserLogger.error('重新连接失败:', error);
       throw error;
     }
+  }
+
+  /**
+   * 清理空闲连接
+   */
+  private async cleanupIdleConnections(): Promise<void> {
+    try {
+      browserLogger.info('开始清理空闲连接...');
+      
+      // 清理连接池中的空闲连接
+      const now = Date.now();
+      for (const [key, connection] of this.connectionPool.entries()) {
+        if (now - connection.lastUsed > this.connectionIdleTimeout) {
+          this.connectionPool.delete(key);
+          browserLogger.debug(`已清理空闲连接: ${key}`);
+        }
+      }
+
+      // 如果没有活跃任务，可以考虑断开主连接
+      if (this.connectionPool.size === 0) {
+        browserLogger.info('无活跃连接，保持主连接但进入低功耗模式');
+        // 不完全断开，而是进入低功耗模式
+        this.lastActivityTime = now; // 重置活跃时间
+      }
+    } catch (error) {
+      browserLogger.error('清理空闲连接时出错:', error);
+    }
+  }
+
+  /**
+   * 更新活跃时间
+   */
+  private updateActivityTime(): void {
+    this.lastActivityTime = Date.now();
   }
 
   /**
    * 调用 MCP 工具的通用方法
    */
   private async callTool(toolName: string, args: any = {}): Promise<any> {
+    // 更新活跃时间
+    this.updateActivityTime();
+    
     try {
       // 检查连接状态
-      if (!this.isConnectedToMCP()) {
-        console.log('MCP 服务未连接，尝试重新连接...');
+      if (!mcpService.isConnectedToMCP()) {
+        browserLogger.info('MCP 服务未连接，尝试重新连接...');
         await this.connect();
-      }
-      
-      return await mcpService.callTool(toolName, args);
-    } catch (error) {
-      console.error(`调用 MCP 工具 ${toolName} 失败:`, error);
-      
-      // 如果是连接相关错误，尝试重连
-      if (this.isConnectionError(error)) {
-        console.log('检测到连接错误，尝试重新连接...');
-        await this.connect();
+        // 连接后等待500ms确保稳定
+        await new Promise(resolve => setTimeout(resolve, 500));
         
-        // 重连后重试一次
+        // 二次检查连接状态
+        if (!mcpService.isConnectedToMCP()) {
+          throw new Error('MCP 服务连接失败');
+        }
+      }
+
+      const result = await mcpService.callTool(toolName, args);
+      return result;
+    } catch (error) {
+      browserLogger.error(`调用工具 ${toolName} 失败:`, error);
+      
+      // 检查是否为连接相关错误
+      if (this.isConnectionError(error)) {
+        browserLogger.warn('检测到连接错误，尝试重新连接...');
         try {
+          // 重置连接状态
+          this.resetConnectionState();
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // 重新连接
+          await this.connect();
+          
+          // 重试工具调用
+          browserLogger.info(`重新连接成功，重试调用工具 ${toolName}...`);
           return await mcpService.callTool(toolName, args);
         } catch (retryError) {
-          console.error(`重试调用 MCP 工具 ${toolName} 仍然失败:`, retryError);
+          browserLogger.error('重新连接后重试失败:', retryError);
           throw retryError;
         }
       }
@@ -156,7 +285,7 @@ export class BrowserService {
         }
       ];
     } catch (error) {
-      console.error('获取浏览器标签页失败:', error);
+      browserLogger.error('获取浏览器标签页失败:', error);
       return [];
     }
   }
@@ -166,14 +295,26 @@ export class BrowserService {
    */
   async createNewTab(): Promise<string> {
     try {
+      // 确保MCP连接可用
+      if (!this.isConnectedToMCP()) {
+        browserLogger.info('创建标签页前检查连接状态...');
+        await this.connect();
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
       const result = await this.callTool('new_page', {
         url: 'about:blank'
       });
+      
       this.currentPageId = result.pageId || result.id || 'default-page';
-      console.log(`已创建新标签页: ${this.currentPageId}`);
+      browserLogger.info(`已创建新标签页: ${this.currentPageId}`);
+      
+      // 等待页面加载完成
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
       return this.currentPageId;
     } catch (error) {
-      console.error('创建新标签页失败:', error);
+      browserLogger.error('创建新标签页失败:', error);
       throw error;
     }
   }
@@ -224,18 +365,32 @@ export class BrowserService {
     try {
       // 如果没有当前页面ID，先创建一个新页面
       if (!this.currentPageId) {
+        console.log('没有活动页面，创建新标签页...');
         await this.createNewTab();
       }
       
+      // 确保连接状态良好
+      if (!this.isConnectedToMCP()) {
+        console.log('导航前检查连接状态...');
+        await this.connect();
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      console.log(`开始导航到: ${url}`);
       await this.callTool('navigate_page', {
         url: url
       });
       
+      // 等待页面加载
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      console.log(`成功导航到: ${url}`);
       return {
         success: true,
         message: `成功导航到 ${url}`
       };
     } catch (error) {
+      console.error(`导航到 ${url} 失败:`, error);
       return {
         success: false,
         message: `导航失败: ${error instanceof Error ? error.message : '未知错误'}`,
@@ -278,8 +433,8 @@ export class BrowserService {
           y: params.y
         };
         // 使用evaluate_script实现坐标点击
-        const clickScript = `document.elementFromPoint(${params.x}, ${params.y})?.click()`;
-        await this.callTool('evaluate_script', { script: clickScript });
+        const clickScript = `() => { document.elementFromPoint(${params.x}, ${params.y})?.click(); }`;
+        await this.callTool('evaluate_script', { function: clickScript });
       } else if (params.selector) {
         // 使用选择器点击
         clickArgs.selector = params.selector;
@@ -288,8 +443,8 @@ export class BrowserService {
         // 使用文本点击
         clickArgs.text = params.text;
         // 使用evaluate_script实现文本点击
-        const clickTextScript = `Array.from(document.querySelectorAll('*')).find(el => el.textContent?.includes('${params.text}'))?.click()`;
-        await this.callTool('evaluate_script', { script: clickTextScript });
+        const clickTextScript = `() => { Array.from(document.querySelectorAll('*')).find(el => el.textContent?.includes('${params.text}'))?.click(); }`;
+        await this.callTool('evaluate_script', { function: clickTextScript });
       } else {
         throw new Error('必须提供坐标、选择器或文本');
       }
@@ -355,8 +510,8 @@ export class BrowserService {
       }
       
       // 使用evaluate_script实现滚动
-      const scrollScript = `window.scrollBy(${params.direction === 'left' ? -(params.distance || 300) : params.direction === 'right' ? (params.distance || 300) : 0}, ${params.direction === 'up' ? -(params.distance || 300) : params.direction === 'down' ? (params.distance || 300) : 0})`;
-      await this.callTool('evaluate_script', { script: scrollScript });
+      const scrollScript = `() => { window.scrollBy(${params.direction === 'left' ? -(params.distance || 300) : params.direction === 'right' ? (params.distance || 300) : 0}, ${params.direction === 'up' ? -(params.distance || 300) : params.direction === 'down' ? (params.distance || 300) : 0}); }`;
+      await this.callTool('evaluate_script', { function: scrollScript });
       
       return {
         success: true,
@@ -459,6 +614,64 @@ export class BrowserService {
    */
   private async extractData(params: any): Promise<BrowserActionResult> {
     try {
+      // 如果没有提供selector，则提取页面中所有可交互元素的信息
+      if (!params.selector) {
+        browserLogger.info('没有提供selector，提取页面中所有可交互元素信息');
+        
+        // 提取页面中所有可交互元素的脚本
+        const extractAllElementsScript = `() => {
+          const elements = [];
+          const interactiveSelectors = [
+            'input[type="text"]', 'input[type="email"]', 'input[type="password"]', 
+            'input[type="search"]', 'input[type="tel"]', 'input[type="url"]',
+            'textarea', 'select', 'button', 'a[href]', 
+            '[onclick]', '[role="button"]', '[tabindex]',
+            'input[type="submit"]', 'input[type="button"]'
+          ];
+          
+          interactiveSelectors.forEach(selector => {
+            const nodeList = document.querySelectorAll(selector);
+            nodeList.forEach((element, index) => {
+              if (element.offsetParent !== null) { // 只包含可见元素
+                const rect = element.getBoundingClientRect();
+                const uid = \`\${selector.replace(/[\[\]\"\'\.\#\:\(\)]/g, '_')}_\${index}\`;
+                element.setAttribute('data-uid', uid);
+                
+                elements.push({
+                  uid: uid,
+                  tagName: element.tagName.toLowerCase(),
+                  type: element.type || '',
+                  text: element.textContent?.trim().substring(0, 50) || '',
+                  placeholder: element.placeholder || '',
+                  value: element.value || '',
+                  href: element.href || '',
+                  selector: selector,
+                  position: {
+                    x: Math.round(rect.left),
+                    y: Math.round(rect.top),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
+                  }
+                });
+              }
+            });
+          });
+          
+          return elements;
+        }`;
+        
+        const result = await this.callTool('evaluate_script', { function: extractAllElementsScript });
+        
+        browserLogger.info(`成功提取 ${result?.length || 0} 个可交互元素`);
+        
+        return {
+          success: true,
+          message: `成功提取 ${result?.length || 0} 个可交互元素`,
+          data: result
+        };
+      }
+      
+      // 如果提供了selector，使用原有逻辑
       const extractArgs: any = {
         selector: params.selector
       };
@@ -473,9 +686,9 @@ export class BrowserService {
       
       // 使用evaluate_script实现数据提取
       const extractScript = params.attribute 
-        ? `document.querySelector('${params.selector}')?.getAttribute('${params.attribute}')`
-        : `document.querySelector('${params.selector}')?.textContent`;
-      const result = await this.callTool('evaluate_script', { script: extractScript });
+        ? `() => { return document.querySelector('${params.selector}')?.getAttribute('${params.attribute}'); }`
+        : `() => { return document.querySelector('${params.selector}')?.textContent; }`;
+      const result = await this.callTool('evaluate_script', { function: extractScript });
       
       return {
         success: true,
@@ -483,6 +696,7 @@ export class BrowserService {
         data: result
       };
     } catch (error) {
+      browserLogger.error('数据提取失败:', error);
       return {
         success: false,
         message: `数据提取失败: ${error instanceof Error ? error.message : '未知错误'}`,
@@ -498,8 +712,8 @@ export class BrowserService {
   private async findElement(selector: string): Promise<any> {
     try {
       // 使用evaluate_script实现元素查找
-      const findScript = `document.querySelector('${selector}') ? true : false`;
-      const result = await this.callTool('evaluate_script', { script: findScript });
+      const findScript = `() => { return document.querySelector('${selector}') ? true : false; }`;
+      const result = await this.callTool('evaluate_script', { function: findScript });
       
       return result;
     } catch (error) {
@@ -516,8 +730,8 @@ export class BrowserService {
   private async sendCommand(method: string, params: any = {}): Promise<any> {
     try {
       // 根据MCP工具列表，没有send_devtools_command工具，使用evaluate_script替代
-      const commandScript = `console.log('DevTools命令: ${method}', ${JSON.stringify(params)})`;
-      return await this.callTool('evaluate_script', { script: commandScript });
+      const commandScript = `() => { console.log('DevTools命令: ${method}', ${JSON.stringify(params)}); }`;
+      return await this.callTool('evaluate_script', { function: commandScript });
     } catch (error) {
       console.error(`发送命令 ${method} 失败:`, error);
       throw error;
@@ -557,7 +771,7 @@ export class BrowserService {
     try {
       // 【第一层检查】MCP服务连接状态
       if (!this.isConnectedToMCP()) {
-        console.warn('健康检查: MCP服务未连接');
+        browserLogger.warn('健康检查: MCP服务未连接');
         return false;
       }
       
@@ -565,7 +779,7 @@ export class BrowserService {
       // 这能检测到连接存在但无法正常通信的情况
       const tools = await mcpService.listTools();
       if (!tools || tools.length === 0) {
-        console.warn('健康检查: 无法获取MCP工具列表');
+        browserLogger.warn('健康检查: 无法获取MCP工具列表');
         return false;
       }
       
@@ -573,18 +787,21 @@ export class BrowserService {
       // 确保浏览器页面仍然有效，避免操作失效的页面
       if (this.currentPageId) {
         try {
-          // 尝试获取页面信息来验证页面是否仍然有效
-          await mcpService.callTool('get_page_info', {});
+          // 使用evaluate_script来验证页面是否仍然有效
+          // 通过检查document对象来确认页面状态
+          await mcpService.callTool('evaluate_script', { 
+            function: '() => document.readyState' 
+          });
         } catch (pageError) {
-          console.warn('健康检查: 当前页面可能已失效:', pageError);
+          browserLogger.warn('健康检查: 当前页面可能已失效:', pageError);
           this.currentPageId = null; // 清除无效的页面ID
         }
       }
       
-      console.log('健康检查通过');
+      browserLogger.debug('健康检查通过');
       return true;
     } catch (error) {
-      console.error('健康检查失败:', error);
+      browserLogger.error('健康检查失败:', error);
       return false;
     }
   }
@@ -616,11 +833,75 @@ export class BrowserService {
   }
 
   /**
+   * 获取连接池状态
+   */
+  getConnectionPoolStatus(): ConnectionPoolStatus {
+    const now = Date.now();
+    let activeConnections = 0;
+    let idleConnections = 0;
+
+    for (const connection of this.connectionPool.values()) {
+      if (now - connection.lastUsed < this.connectionIdleTimeout) {
+        activeConnections++;
+      } else {
+        idleConnections++;
+      }
+    }
+
+    return {
+      totalConnections: this.connectionPool.size,
+      activeConnections,
+      idleConnections,
+      lastUsedTime: this.lastActivityTime,
+      connectionHealth: mcpService.isConnectedToMCP()
+    };
+  }
+
+  /**
+   * 添加连接到连接池
+   */
+  private addToConnectionPool(key: string, connection: any): void {
+    if (this.connectionPool.size >= this.maxPoolSize) {
+      // 移除最旧的连接
+      const oldestKey = Array.from(this.connectionPool.keys())[0];
+      this.connectionPool.delete(oldestKey);
+      console.log(`连接池已满，移除最旧连接: ${oldestKey}`);
+    }
+
+    this.connectionPool.set(key, {
+      ...connection,
+      lastUsed: Date.now()
+    });
+  }
+
+  /**
+   * 从连接池获取连接
+   */
+  private getFromConnectionPool(key: string): any | null {
+    const connection = this.connectionPool.get(key);
+    if (connection) {
+      connection.lastUsed = Date.now();
+      this.updateActivityTime();
+      return connection;
+    }
+    return null;
+  }
+
+  /**
    * 断开连接
    */
   async disconnect(): Promise<void> {
     try {
-      console.log('正在断开浏览器服务连接...');
+      browserLogger.info('正在断开浏览器服务连接...');
+      
+      // 停止持久化连接管理
+      if (this.keepAliveInterval) {
+        clearInterval(this.keepAliveInterval);
+        this.keepAliveInterval = null;
+      }
+
+      // 清理连接池
+      this.connectionPool.clear();
       
       // 清理当前页面状态
       this.currentPageId = null;
@@ -631,12 +912,36 @@ export class BrowserService {
       // 重置连接状态
       this.resetConnectionState();
       
-      console.log('浏览器服务已断开连接');
+      browserLogger.info('浏览器服务已断开连接');
     } catch (error) {
-      console.error('断开连接时出错:', error);
+      browserLogger.error('断开连接时出错:', error);
       
       // 即使出错也要重置状态
       this.resetConnectionState();
+      if (this.keepAliveInterval) {
+        clearInterval(this.keepAliveInterval);
+        this.keepAliveInterval = null;
+      }
+      this.connectionPool.clear();
+    }
+  }
+
+  /**
+   * 优雅关闭服务
+   */
+  async gracefulShutdown(): Promise<void> {
+    browserLogger.info('开始优雅关闭浏览器服务...');
+    
+    try {
+      // 等待当前操作完成（如果有的话）
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // 断开连接
+      await this.disconnect();
+      
+      browserLogger.info('浏览器服务已优雅关闭');
+    } catch (error) {
+      browserLogger.error('优雅关闭时出错:', error);
     }
   }
 }

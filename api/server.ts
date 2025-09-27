@@ -1,32 +1,33 @@
 /**
  * local server entry file, for local development
  */
-import app from './app.js';
+import app, { initializeServices, shutdownServices } from './app.js';
+import { serverLogger } from './utils/logger.js';
 
-/**
- * start server with port
- */
 const PORT = process.env.PORT || 3002;
 
-const server = app.listen(PORT, () => {
-  console.log(`Server ready on port ${PORT}`);
+const server = app.listen(PORT, async () => {
+  serverLogger.info(`服务器已启动，监听端口 ${PORT}`);
+  
+  // 初始化所有服务
+  await initializeServices(server);
 });
 
-/**
- * close server
- */
-process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received');
+// 优雅关闭处理
+process.on('SIGTERM', async () => {
+  serverLogger.info('收到 SIGTERM 信号');
+  await shutdownServices();
   server.close(() => {
-    console.log('Server closed');
+    serverLogger.info('服务器已关闭');
     process.exit(0);
   });
 });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT signal received');
+process.on('SIGINT', async () => {
+  serverLogger.info('收到 SIGINT 信号');
+  await shutdownServices();
   server.close(() => {
-    console.log('Server closed');
+    serverLogger.info('服务器已关闭');
     process.exit(0);
   });
 });
